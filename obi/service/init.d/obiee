@@ -1,0 +1,532 @@
+#!/bin/bash
+# chkconfig: 345 95 20
+# description: Start up OBIEE processes
+# 
+# File:    /etc/init.d/obiee
+# Purpose: Start and stop Oracle Business Intelligence 11g components.
+# Author: @rmoff / Rittman Mead Consulting, July 2013
+# Absolutely no warranty, use at your own risk
+# Please include this header in any copy or reuse of the script you make
+# 
+# Version: 1.84
+#
+# Originally based on: https://forums.oracle.com/forums/thread.jspa?threadID=2179408, since gutted and rebuilt.
+#
+# Usage: 
+#   1. Create this file at /etc/init.d/obiee
+#   2. chmod 750 /etc/init.d/obiee
+#   3. chkconfig --add obiee
+#   4. Setup /etc/sysconfig/obiee, see git repo for sample copy
+# 
+# If not in place already, configure boot.properties for Admin and Managed Servers so that you're not
+# prompted for credentials when you start/stop them. 
+# Ref: http://docs.oracle.com/cd/E28280_01/web.1111/e13708/overview.htm#i1068920
+#
+# Known issues: https://github.com/RittmanMead/scripts/issues/
+# ---------------------------------
+
+# Source config file
+. /etc/sysconfig/obiee
+
+export ORACLE_INSTANCE
+# --------------------------
+# Source function library.
+if [ -f /etc/rc.d/init.d/functions ]; then
+      . /etc/rc.d/init.d/functions
+fi
+# --------------------------
+#
+NODE_MANAGER_FINGERPRINT=$FMW_HOME'.*weblogic.NodeManager'
+ADMIN_SERVER_FINGERPRINT='Dweblogic.Name=AdminServer.*'$WLS_DOMAIN_PATH
+MANAGED_SERVER_FINGERPRINT='Dweblogic.Name=bi_server1.*'$WLS_DOMAIN_PATH
+OPMN_FINGERPRINT=$FMW_HOME'.*/bin/opmn'
+#
+# ---------------------------------
+
+# SUBSYS must match the script name (eg obiee), as it is used for the process lockfile
+SUBSYS=$(basename $0)
+LOCK_FILE='/var/lock/subsys/'$SUBSYS
+START_LOG=$LOG_PATH/$SUBSYS-start.log
+STOP_LOG=$LOG_PATH/$SUBSYS-stop.log
+
+#
+#------------------
+# Check paths and permissions
+#
+if [ ! -d $FWW_HOME ] ; then
+	echo ''
+	echo -n '**FMW_HOME '$FMW_HOME' not found**'
+	echo_failure
+	echo ''
+fi
+
+if [ ! -f $LSOF_PATH ] ; then
+	echo ''
+	echo -n '**lsof binary not found at '$LSOF_PATH' **'
+	echo_failure
+	echo ''
+fi
+
+check_permissions() {
+
+	abort=0
+
+	if [ ! -f $LOCK_FILE ] ; then
+		if [ $(touch $LOCK_FILE 2>&1|grep "Permission denied"|wc -l) -ne 0 ] ; then
+			echo ''
+			echo '** Lock file '$LOCK_FILE' is not writable by '$(whoami)' **'
+			echo_failure
+			echo ''
+			abort=1
+		fi
+	else
+		if [ ! -w $LOCK_FILE ] ; then
+			echo ''
+			echo '** Lock file '$LOCK_FILE' is not writable by '$(whoami)' **'
+			echo_failure
+			echo ''
+			abort=1
+		fi
+	fi
+
+	if [ ! -f $START_LOG ] ; then
+		if [ $(touch $START_LOG 2>&1|grep "Permission denied"|wc -l) -ne 0 ] ; then
+			echo ''
+			echo '** Log file '$START_LOG' is not writable by '$(whoami)' **'
+			echo_warning
+			echo ''
+			abort=1
+		fi
+	else
+		if [ ! -w $START_LOG ] ; then
+			echo ''
+			echo '** Log file '$START_LOG' is not writable by '$(whoami)' **'
+			echo_warning
+			echo ''
+		fi
+	fi
+
+	if [ ! -f $STOP_LOG ] ; then
+		if [ $(touch $STOP_LOG 2>&1|grep "Permission denied"|wc -l) -ne 0 ] ; then
+			echo ''
+			echo '** Log file '$STOP_LOG' is not writable by '$(whoami)' **'
+			echo_warning
+			echo ''
+		fi
+	else
+		if [ ! -w $STOP_LOG ] ; then
+			echo ''
+			echo '** Log file '$STOP_LOG' is not writable by '$(whoami)' **'
+			echo_warning
+			echo ''
+		fi
+	fi
+
+	if [ $abort -eq 1 ] ; then
+		echo -e '\n\n-------------\nTo start/stop this script must be run as root (directly, or with sudo)\n\n'
+		exit 255
+	fi
+}
+#
+#------------------
+#
+start() {
+	echo -en "\nStarting OBI Admin Server "
+	su $ORACLE_OWNR -c "$WLS_DOMAIN_BIN/startWebLogic.sh" > $START_LOG 2>&1 & 
+	wait_to_start $ADMIN_SERVER_FINGERPRINT $ADMIN_SERVER_START_TIMEOUT
+
+	if [ $? -eq 0 ] ; then 
+
+		echo -n "Starting OBI Node Manager "
+		su $ORACLE_OWNR -c "$WLS_PATH/startNodeManager.sh" >> $START_LOG 2>&1 & 
+		wait_to_start $NODE_MANAGER_FINGERPRINT $NODE_MANAGER_START_TIMEOUT
+
+		if [ $? -eq 0 ] ; then 
+			echo -n "Starting OBI Managed Server" 
+			su $ORACLE_OWNR -c "$WLS_DOMAIN_BIN/startManagedWebLogic.sh $WLS_MANAGED_SERVER" >> $START_LOG 2>&1 &
+			wait_to_start $MANAGED_SERVER_FINGERPRINT $MANAGED_SERVER_START_TIMEOUT
+
+			if [ $? -eq 0 ] ; then 
+				echo -n "Initiating OBI OPMN startup "
+				su $ORACLE_OWNR -c "$ORACLE_INSTANCE/bin/opmnctl startall" >> $START_LOG 2>&1
+				wait_to_start $OPMN_FINGERPRINT $OPMN_START_TIMEOUT
+			fi
+		fi
+	fi
+	echo ''
+
+}
+
+stop() {
+	echo -en "\nShutting down OPMN and BI Components"
+	su $ORACLE_OWNR -c "$ORACLE_INSTANCE/bin/opmnctl stopall" > $STOP_LOG 2>&1
+	wait_to_die $OPMN_FINGERPRINT $OPMN_STOP_TIMEOUT
+
+	echo -n "Shutting down OBI Managed Server"
+	su $ORACLE_OWNR -c "$WLS_DOMAIN_BIN/stopManagedWebLogic.sh $WLS_MANAGED_SERVER" >> $STOP_LOG 2>&1
+	wait_to_die $MANAGED_SERVER_FINGERPRINT $MANAGED_SERVER_STOP_TIMEOUT
+
+	echo -n "Shutting down OBI Node Manager"
+	echo " Killing pid: " $(pgrep $NODE_MANAGER_FINGERPRINT) >> $STOP_LOG 2>&1
+	pkill -f $NODE_MANAGER_FINGERPRINT
+	wait_to_die $NODE_MANAGER_FINGERPRINT $NODE_MANAGER_STOP_TIMEOUT
+
+	echo -n "Shutting down OBI Admin Server"
+	su $ORACLE_OWNR -c "$WLS_DOMAIN_BIN/stopWebLogic.sh" >> $STOP_LOG 2>&1
+	wait_to_die $ADMIN_SERVER_FINGERPRINT $ADMIN_SERVER_STOP_TIMEOUT
+
+	echo ''
+}
+
+
+echo_opmn_processes_status () {
+	status=$(su $ORACLE_OWNR -c "$ORACLE_INSTANCE/bin/opmnctl status"|tail -n+6|head -n-1|awk '{print $7}'|sort -u)
+	echo -en '\t'
+	case $status in 
+		"Alive")
+			echo -n "All OPMN-managed BI Components are running"
+			echo_success
+			;;
+		"Init")
+			echo -n "All OPMN-managed BI Components are starting"
+			echo_warning
+			;;
+		"Down"|"Stop")
+			echo -n "No OPMN-managed BI Components are running"
+			echo_failure
+			;;
+		*)
+			echo -n "Some OPMN-managed BI Components are not running"
+			echo_warning
+			echo ''
+			su $ORACLE_OWNR -c "$ORACLE_INSTANCE/bin/opmnctl status -l"
+	esac
+	echo ''
+}
+check_process_ports () {
+	# Pass the 'fingerprint' of the process to check, which should be a regex to uniquely
+	# identify the process in a pgrep -f call
+	#
+	# Returns: 
+	# 0 - Process not running
+	# 1 - Process running but not listening on any port
+	# <ports> - the port(s) on which the process is listening
+	PID=$(pgrep -f $1)
+	if [ $? -eq 0 ] ; then
+		PORT=$(pgrep -f $1|xargs -I'{}' $LSOF_PATH -nPp {}|grep LISTEN|awk -F ":" '{print $2}'|cut -d " " -f 1|sort -u|paste -s)
+		if [ -n "$PORT" ] ; then
+			echo $PORT
+		else
+			echo 1
+		fi
+	else
+		echo 0
+	fi
+}
+
+
+echo_process_status () {
+	rc=$(check_process_ports $1)
+	case "$rc" in
+		0)
+			echo_not_running
+			;;
+		1)	
+			echo_in_progress
+			;;
+		*)
+			echo -n "listening on port" $rc
+			echo_success
+	esac
+	echo ' '
+}
+
+
+status () {
+	echo ''
+
+	echo -n ' Checking WLS Admin Server: '
+        echo_process_status $ADMIN_SERVER_FINGERPRINT
+
+	echo -n ' Checking WLS Node Manager: '
+        echo_process_status $NODE_MANAGER_FINGERPRINT
+
+	echo -n ' Checking WLS Managed Server: '
+        echo_process_status $MANAGED_SERVER_FINGERPRINT
+	if [ "$(check_process_ports $MANAGED_SERVER_FINGERPRINT)" != "0" ] ; then
+		check_analytics
+	fi
+
+	echo -n ' Checking OPMN: '
+        echo_process_status $OPMN_FINGERPRINT
+	if [ "$(check_process_ports $OPMN_FINGERPRINT)" != "0" ] ; then
+		echo_opmn_processes_status
+	fi
+
+	echo ''
+}
+
+version () {
+
+	# Check if unzip exists
+	if [ -f `which unzip` ] ; then
+	
+		# Check if analytics.ear exists
+		if [ ! -f $ANALYTICS_EAR ] ; then
+		
+		echo 'analytics.ear containing the version file (MANIFEST.MF) not found. checking .../tmp/_WL_user'
+		
+			# Check if manifest.mf exists in /tmp/_WL_user
+			if [ ! -f $WL_TMP_MANIFEST ] ; then
+			
+			echo '.../tmp/_WL_user/ MANIFEST.MF not found. checking base version file'
+			
+				# Check if actual version.txt exists
+				if [ -f $BIEE_VERSION_FILE ] ; then
+					echo ''
+					echo -n ' OBIEE version: '
+					grep -i version $BIEE_VERSION_FILE | awk -F ': ' '{print $2}'
+					echo ''
+				else
+					echo 'base version file not found'
+				fi
+			else
+				grep -i Implementation-Version $WL_TMP_MANIFEST | awk -F ': ' '{print $2}'
+			fi	
+		else
+			echo ''
+			echo -n ' OBIEE version: '
+			unzip -p $ANALYTICS_EAR META-INF/MANIFEST.MF | grep -i Implementation-Version | awk -F ': ' '{print $2}'			
+			echo ''
+		fi
+	else
+		# Check if manifest.mf exists in /tmp/_WL_user
+		if [ ! -f $WL_TMP_MANIFEST ] ; then
+		
+		echo '.../tmp/_WL_user/ MANIFEST.MF not found. checking base version file'
+		
+			# Check if actual version.txt exists
+			if [ -f $BIEE_VERSION_FILE ] ; then
+				echo ''
+				echo -n ' OBIEE version: '
+				grep -i version $BIEE_VERSION_FILE | awk -F ': ' '{print $2}'
+				echo ''
+			else
+				echo 'base version file not found'
+			fi
+		else
+			echo ''
+			echo -n ' OBIEE version: '
+			grep -i Implementation-Version $WL_TMP_MANIFEST | awk -F ': ' '{print $2}'
+			echo ''
+		fi
+	fi
+}
+
+check_analytics() {
+	accessible=0
+	# This will probe the managed server to try and work out if analytics is working or not
+	# If the managed server has been configured not to listen locally (localhost) then this
+	# will give a false negative
+	for i in $(check_process_ports $MANAGED_SERVER_FINGERPRINT |sed 's/ /\n/') ; do 
+		# This only works for non-SSL connections
+		http_response=$(curl -s -o /dev/null --location -w ""%{http_code}"" http://$(hostname):$i/analytics)
+		if [ $http_response == 200 ] ; then
+			echo -n ' OBIEE login page is accessible (non-SSL)'
+			echo_success
+			echo ''
+			echo '   at http://'$(hostname)':'$i'/analytics'
+			accessible=1
+		elif [ $http_response == 401 ] ; then
+			echo -n ' OBIEE login page (non-SSL) is up and SSO enabled [401]'
+			echo_success
+			echo ''
+			echo '   at https://'$(hostname)':'$i'/analytics'
+			accessible=1
+		else
+			# Let's try on HTTPS instead, telling curl to ignore any SSL certificate errors (--insecure)
+			https_response=$(curl --insecure -s -o /dev/null --location -w ""%{http_code}"" https://$(hostname):$i/analytics)
+			rc=$?
+			if [ $https_response == 200 ] ; then
+				echo -n ' OBIEE login page is accessible (SSL)'
+				echo_success
+				echo ''
+				echo '   at https://'$(hostname)':'$i'/analytics'
+				accessible=1
+			elif [ $https_response == 401 ] ; then
+				echo -n ' OBIEE login page (SSL) is up and SSO enabled [401]'
+				echo_success
+				echo ''
+				echo '   at https://'$(hostname)':'$i'/analytics'
+				accessible=1
+			fi
+		fi
+	done
+	if [ $accessible -eq 1 ] ; then 
+		return 0
+	else
+		echo ''
+		echo -n '** OBIEE login page is not accessible **'
+		echo_failure
+		echo ''
+		echo '  Login to the WLS Console and check : '
+		echo '   - the Managed Server state is RUNNING' 
+		echo '   - the Application Deployment "analytics" is running'
+	fi
+}
+
+wait_to_die() {
+	# check_process_ports will return 0 (not running), 1 (starting up) or other (port value)
+	# This function will poll the process and based on the value returned (in rc) keep polling, 
+	# or after the predefined timeout period, kill the process by force.
+	rc=999
+	timeout=$2
+	if [ -z $timeout ] ; then 
+		timeout=600
+	fi
+	# 30 is enough space on the line for the . to appear without overlapping the status message
+	sleep_period=$(($timeout/30))
+	[[ $sleep_period -eq 0 ]] && sleep_period=1
+	fingerprint=$1
+	starttime=$(date +%s)
+	while [ "$rc" != "0" ]
+	do
+		rc=$(check_process_ports $fingerprint)
+		nowtime=$(date +%s)
+		timediff=$(( $nowtime - $starttime ))
+		if [ $timediff -gt $timeout ] ; then
+			echo_warning
+			echo ''
+			echo -e '\tTimed out after '$timeout' seconds'
+			echo -en '\tSending SIGKILL. '
+			pkill -SIGKILL -f $fingerprint
+			sleep 5
+			rc=$(check_process_ports $1)
+			case "$rc" in
+				0)
+					echo -n 'Process killed'
+					echo_success
+					;;
+				*)
+					echo -n "Process still running"
+					echo_failure
+			esac
+			echo ''
+			return 1
+		fi
+		echo -n '.'
+		if [ "$rc" != "0" ] ; then
+			sleep $sleep_period
+		fi
+	done
+	echo_success
+	echo ''
+	return 0
+}
+
+wait_to_start() {
+	# check_process_ports will return 0 (not running), 1 (starting up) or other (port value)
+	# This function will poll the process and based on the value returned (in rc) keep polling, 
+	# or after the predefined timeout period, give up.
+	rc=1
+	timeout=$2
+	if [ -z $timeout ] ; then 
+		timeout=600
+	fi
+	# 30 is enough space on the line for the . to appear without overlapping the status message
+	sleep_period=$(($timeout/30))
+	[[ $sleep_period -eq 0 ]] && sleep_period=1
+	fingerprint=$1
+	#echo 'Timeout: '$timeout ', Sleep period: '$sleep_period', Fingerprint: '$fingerprint
+	starttime=$(date +%s)
+	while [ "$rc" == "1" ]
+	do
+		sleep $sleep_period
+		rc=$(check_process_ports $fingerprint)
+		nowtime=$(date +%s)
+		timediff=$(( $nowtime - $starttime ))
+		if [ $timediff -gt $timeout ] ; then
+			echo -n ' '
+			echo -n ' (Timed out after '$timeout' seconds ) '
+			break
+		fi
+		echo -n '.'
+	done
+	case "$rc" in
+		0|1)
+			echo_failure
+			rc=255
+			;;
+		*)
+			echo_success
+			rc=0
+			;;
+	esac
+	echo ''
+	#echo '--'
+	#echo $rc
+	#echo '--'
+	return $rc
+}
+		
+		
+
+echo_not_running() {
+  [ "$BOOTUP" = "color" ] && $MOVE_TO_COL
+  echo -n "["
+  [ "$BOOTUP" = "color" ] && $SETCOLOR_FAILURE
+  echo -n $"NOT RUNNING"
+  [ "$BOOTUP" = "color" ] && $SETCOLOR_NORMAL
+  echo -n "]"
+  echo -ne "\r"
+  return 1
+}
+
+echo_in_progress() {
+  [ "$BOOTUP" = "color" ] && $MOVE_TO_COL
+  echo -n "["
+  [ "$BOOTUP" = "color" ] && $SETCOLOR_WARNING
+  echo -n $"IN PROGRESS"
+  [ "$BOOTUP" = "color" ] && $SETCOLOR_NORMAL
+  echo -n "]"
+  echo -ne "\r"
+  return 1
+}
+
+case "$1" in
+    start|startup)
+    	version
+	check_permissions
+        start 
+	sleep 60
+	status
+	echo ''
+        touch $LOCK_FILE
+	;;
+    stop|shutdown)
+    	version
+	check_permissions
+        stop 
+        rm -f $LOCK_FILE
+    ;;
+    status)
+    	version
+	status
+    ;;
+    restart)
+    	version
+        stop
+        start
+    ;;
+    version)
+        version
+    ;;
+    debug)
+        echo "[debug mode]"
+    ;;
+    *)
+        echo "Usage: $(basename $0) start|stop|restart|status|version"
+        exit 1
+esac
+
+[[ "$1" != "debug" ]] && exit 0

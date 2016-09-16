@@ -1,2 +1,1 @@
-# BI-Blues
-OBIEE Tips &amp; Tricks
+A collection of scripts and utilities to make the OBI admin's life easier
